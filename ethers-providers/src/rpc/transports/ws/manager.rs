@@ -4,10 +4,12 @@ use super::{
     WsClient, WsClientError,
 };
 use crate::JsonRpcError;
+use async_recursion::async_recursion;
 use ethers_core::types::U256;
 use futures_channel::{mpsc, oneshot};
 use futures_util::{select_biased, StreamExt};
 use serde_json::value::RawValue;
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -15,6 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use tokio::time::sleep;
 
 pub type SharedChannelMap = Arc<Mutex<HashMap<U256, mpsc::UnboundedReceiver<Box<RawValue>>>>>;
 
@@ -234,56 +237,69 @@ impl RequestManager {
         ))
     }
 
+    #[async_recursion]
     async fn reconnect(&mut self) -> Result<(), WsClientError> {
         if self.reconnects == 0 {
-            return Err(WsClientError::TooManyReconnects)
+            return Err(WsClientError::TooManyReconnects);
         }
         self.reconnects -= 1;
 
+        sleep(Duration::from_millis(100)).await;
+
         tracing::info!(remaining = self.reconnects, url = self.conn.url, "Reconnecting to backend");
         // create the new backend
-        let (s, mut backend) = WsBackend::connect(self.conn.clone()).await?;
+        return match WsBackend::connect(self.conn.clone()).await {
+            Ok((s, mut backend)) => {
+                // spawn the new backend
+                s.spawn();
 
-        // spawn the new backend
-        s.spawn();
+                // swap out the backend
+                std::mem::swap(&mut self.backend, &mut backend);
 
-        // swap out the backend
-        std::mem::swap(&mut self.backend, &mut backend);
+                // rename for clarity
+                let mut old_backend = backend;
 
-        // rename for clarity
-        let mut old_backend = backend;
+                // Drain anything in the backend
+                tracing::debug!("Draining old backend to_handle channel");
+                while let Some(to_handle) = old_backend.to_handle.next().await {
+                    self.handle(to_handle);
+                }
 
-        // Drain anything in the backend
-        tracing::debug!("Draining old backend to_handle channel");
-        while let Some(to_handle) = old_backend.to_handle.next().await {
-            self.handle(to_handle);
-        }
+                // issue a shutdown command (even though it's likely gone)
+                old_backend.shutdown();
 
-        // issue a shutdown command (even though it's likely gone)
-        old_backend.shutdown();
+                tracing::debug!(count = self.subs.count(), "Re-starting active subscriptions");
 
-        tracing::debug!(count = self.subs.count(), "Re-starting active subscriptions");
+                // reissue subscriptionps
+                for (id, sub) in self.subs.to_reissue() {
+                    self.backend
+                        .dispatcher
+                        .unbounded_send(sub.serialize_raw(*id)?)
+                        .map_err(|_| WsClientError::DeadChannel)?;
+                }
 
-        // reissue subscriptionps
-        for (id, sub) in self.subs.to_reissue() {
-            self.backend
-                .dispatcher
-                .unbounded_send(sub.serialize_raw(*id)?)
-                .map_err(|_| WsClientError::DeadChannel)?;
-        }
+                tracing::debug!(count = self.reqs.len(), "Re-issuing pending requests");
+                // reissue requests. We filter these to prevent in-flight requests for
+                // subscriptions to be re-issued twice (once in above loop, once in this loop).
+                for (id, req) in self.reqs.iter().filter(|(id, _)| !self.subs.has(**id)) {
+                    self.backend
+                        .dispatcher
+                        .unbounded_send(req.serialize_raw(*id)?)
+                        .map_err(|_| WsClientError::DeadChannel)?;
+                }
+                tracing::info!(
+                    subs = self.subs.count(),
+                    reqs = self.reqs.len(),
+                    "Re-connection complete"
+                );
 
-        tracing::debug!(count = self.reqs.len(), "Re-issuing pending requests");
-        // reissue requests. We filter these to prevent in-flight requests for
-        // subscriptions to be re-issued twice (once in above loop, once in this loop).
-        for (id, req) in self.reqs.iter().filter(|(id, _)| !self.subs.has(**id)) {
-            self.backend
-                .dispatcher
-                .unbounded_send(req.serialize_raw(*id)?)
-                .map_err(|_| WsClientError::DeadChannel)?;
-        }
-        tracing::info!(subs = self.subs.count(), reqs = self.reqs.len(), "Re-connection complete");
-
-        Ok(())
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Error reconnecting to backend");
+                self.reconnect().await
+            }
+        };
     }
 
     #[tracing::instrument(skip(self, result))]
